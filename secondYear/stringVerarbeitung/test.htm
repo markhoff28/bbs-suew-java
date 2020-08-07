@@ -1,0 +1,320 @@
+<?php
+
+
+
+class Database
+{
+	private $driver;
+
+
+
+	public function __construct($host, $user, $password, $database)
+	{
+		$this->driver = @new mysqli($host, $user, $password, $database);
+		if (mysqli_connect_errno())
+		{
+			if (DEBUG_MODE)
+				printf("Connect failed: %s\n", mysqli_connect_error());
+			exit();
+		}
+		$this->driver->set_charset("utf8");
+	}
+
+
+
+	public function escapeValue($value, $autoQuote = false)
+	{
+		if ($value === NULL)
+			return 'NULL';
+		if (is_array($value))
+		{
+			if (count($value) == 1)
+				return $value[0];
+			return 'NULL';
+		}
+
+		$newValue = $this->driver->real_escape_string($value);
+		if ($autoQuote && (gettype($value) == 'string'))
+			$newValue = "'$newValue'";
+		return $newValue;
+	}
+
+
+
+	private function escapeAssocKeys($row)
+	{
+		$keys = array_keys($row);
+		foreach ($keys as &$key)
+			$key = '`'.$this->escapeValue($key).'`';
+		return implode(',', $keys);
+	}
+
+
+
+	public function backupTable($tableName)
+	{
+		$backupName = $tableName.date('_Y_m_d_H_i_s');
+		$this->query("CREATE TABLE `$backupName` SELECT * FROM `$tableName`;");
+	}
+
+
+
+	public function escapeAssocValues($row)
+	{
+		$values = array_values($row);
+		foreach ($values as &$value)
+		{
+			if (gettype($value) == 'string')
+				$value = "'".$this->escapeValue($value)."'";
+			else
+				$value = $this->escapeValue($value);
+		}
+		return implode(',', $values);
+	}
+
+
+
+	private function escapeAssoc($row)
+	{
+		$parts = array();
+		foreach($row as $key => $value)
+		{
+			$part = '`'.$this->escapeValue($key, false).'` = '.$this->escapeValue($value, true);
+			array_push($parts, $part);
+		}
+		return implode(', ', $parts);
+	}
+
+
+
+	private function replaceOne($needle, $value, $haystack)
+	{
+		$pos = strpos($haystack, $needle);
+		if ($pos === FALSE)
+			return $haystack;
+
+		return substr($haystack, 0, $pos).$value.substr($haystack, $pos + strlen($needle));
+	}
+
+
+
+	private function escapeArgs($args)
+	{
+		$sql = $args[0];
+		$values = array_slice($args, 1);
+		for ($i = 0; $i < count($values); ++$i)
+			$sql = $this->replaceOne('?', $this->escapeValue($values[$i]), $sql);
+		return $sql;
+	}
+
+
+
+	private function _query($sql, $all = false)
+	{
+		$result = $this->driver->query($sql);
+        if (!$result) $result = FALSE;
+		if ($result === FALSE || $result === TRUE)
+			return $result;
+
+        if ($all)
+        {
+            $rows = array();
+            while ($row = $result->fetch_assoc())
+                array_push($rows, $row);
+        }
+        else
+        {
+            $rows = $result->fetch_assoc();
+        }
+		$result->free();
+		return $rows;
+	}
+
+
+
+	public function query()
+	{
+		$sql = $this->escapeArgs(func_get_args());
+		return $this->_query($sql);
+	}
+
+
+
+	public function fetchAll()
+	{
+		$sql = $this->escapeArgs(func_get_args());
+		$result = $this->_query($sql, true);
+		return (is_array($result)) ? $result : array();
+	}
+
+
+
+	public function fetchAssoc()
+	{
+		$sql = $this->escapeArgs(func_get_args());
+		$rows = $this->_query($sql, true);
+		$result = array();
+		if (is_array($rows))
+		{
+			foreach($rows as $row)
+			{
+				$r = array_values($row);
+				$result[$r[0]] = $r[1];
+			}
+		}
+		return $result;
+	}
+
+
+
+	public function fetchRow()
+	{
+		$sql = $this->escapeArgs(func_get_args());
+		$result = $this->_query($sql);
+		return count($result) > 0 ? $result : null;
+	}
+
+
+
+	public function fetchOne()
+	{
+		$sql = $this->escapeArgs(func_get_args());
+		$result = $this->_query($sql);
+		if (!$result)
+			return null;
+
+		$keys = array_keys($result);
+		return count($keys) > 0 ? $result[$keys[0]] : null;
+	}
+
+
+
+	public function insert($tableName, $row)
+	{
+		$sql = 'INSERT INTO `'.$this->escapeValue($tableName).'` (';
+		$sql = $sql.$this->escapeAssocKeys($row).') VALUES (';
+		$sql = $sql.$this->escapeAssocValues($row).')';
+		$result = $this->_query($sql);
+		return $result ? $this->driver->insert_id : 0;
+	}
+
+
+
+	public function upsert($tableName, $row, $createTimeColumn = null)
+	{
+		$sql = 'INSERT INTO `'.$this->escapeValue($tableName).'` (';
+		$sql = $sql.$this->escapeAssocKeys($row);
+		if ($createTimeColumn)
+			$sql .= ", `".$this->escapeValue($createTimeColumn)."`";
+
+		$sql = $sql.') VALUES ('.$this->escapeAssocValues($row);
+		if ($createTimeColumn)
+			$sql .= ", NOW()";
+
+		$sql = $sql.") ON DUPLICATE KEY UPDATE ";
+		$sql = $sql.$this->escapeAssoc($row);
+		$result = $this->_query($sql);
+	}
+
+
+
+	public function update($tableName, $idColumn, $row)
+	{
+		if (isset($row[$idColumn]))
+		{
+			$sql = 'UPDATE `'.$this->escapeValue($tableName).'` SET ';
+			$sql = $sql.$this->escapeAssoc($row);
+			$sql = $sql.' WHERE (`'.$this->escapeValue($idColumn).'`='.$this->escapeValue($row[$idColumn], true).')';
+			$result = $this->_query($sql);
+		}
+	}
+
+
+
+	public function delete($tableName, $idColumn, $idToDelete)
+	{
+		$sql = 'DELETE FROM `'.$this->escapeValue($tableName).'`';
+		$sql = $sql.' WHERE (`'.$this->escapeValue($idColumn).'`='.$this->escapeValue($idToDelete, true).')';
+		$result = $this->_query($sql);
+	}
+
+
+
+	public function createQuery($tableLayout, $query, $countOnly, $useLimits)
+	{
+		$sql = 'SELECT ';
+		$sql .= $countOnly ? 'COUNT(*)' : '*';
+		$sql .= ' FROM `'.$this->escapeValue($tableLayout['name']).'`';
+
+		if (!$countOnly && isset($tableLayout['leftjoins']) && (count($tableLayout['leftjoins']) > 0))
+			$sql .= ' '.implode(' ', $tableLayout['leftjoins']);
+
+		// where clause
+		$conditions = isset($query['where']) ? $query['where'] : array();
+		if (isset($tableLayout['fields']))
+		{
+			foreach ($tableLayout['fields'] as $field)
+			{
+				if (isset($query[$field]))
+				{
+					$condition = $query[$field];
+					if (is_array($condition))
+					{
+						if (count($condition) > 0)
+							$conditions[] = '`'.$this->escapeValue($field).'` IN ('.$this->escapeAssocValues($condition).')';
+					}
+					else if ((gettype($condition) == 'string') && (strcmp($condition, 'NULL') == 0))
+					{
+						$conditions[] = '`'.$this->escapeValue($field).'` IS NULL';
+					}
+					else if ((gettype($condition) == 'string') && (strcmp($condition, '!NULL') == 0))
+					{
+						$conditions[] = '`'.$this->escapeValue($field).'` IS NOT NULL';
+					}
+					else if ((gettype($condition) == 'string') && isset($tableLayout['fulltext']) && in_array($field, $tableLayout['fulltext']))
+					{
+						if (strlen($condition) > 0)
+							$conditions[] = '`'.$this->escapeValue($field).'` LIKE \'%'.$this->escapeValue($condition).'%\'';
+					}
+					else
+					{
+						$conditions[] = '`'.$this->escapeValue($field).'`='.$this->escapeValue($condition, true);
+					}
+				}
+			}
+		}
+		if (count($conditions) > 0)
+			$sql .= ' WHERE ('.implode(') AND (', $conditions).')';
+
+		if (!$countOnly)
+		{
+			// sort
+			if (isset($query['sortBy']))
+			{
+				$sql .= ' ORDER BY '.$this->escapeValue($query['sortBy']).((isset($query['sortAscending']) && $query['sortAscending']) ? ' ASC' : ' DESC');
+				if (isset($query['sort2By']))
+				{
+					$sql .= ', '.$this->escapeValue($query['sort2By']).((isset($query['sort2Ascending']) && $query['sort2Ascending']) ? ' ASC' : ' DESC');
+				}
+			}
+
+			// limit
+			if ($useLimits && isset($query['limit']) && isset($query['offset']))
+				$sql .= ' LIMIT '.$this->escapeValue($query['offset']).','.$this->escapeValue($query['limit']);
+		}
+
+		return $sql;
+	}
+
+
+
+	public function fetchCreatedQuery($tableLayout, $query)
+	{
+		$result = array();
+		$sql = $this->createQuery($tableLayout, $query, false, true);
+		$result['entries'] = $this->fetchAll($sql);
+		$sql = $this->createQuery($tableLayout, $query, true, false);
+		$result['totalCount'] = $this->fetchOne($sql);
+		return $result;
+	}
+}
